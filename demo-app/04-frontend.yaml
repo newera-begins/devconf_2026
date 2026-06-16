@@ -1,0 +1,211 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: demo-app
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Bookstore - DevConf Demo</title>
+      <style>
+        body { font-family: 'Red Hat Text', Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .header { background: #ee0000; color: white; padding: 20px; margin: -20px -20px 20px; text-align: center; }
+        .header h1 { margin: 0; }
+        .header p { margin: 5px 0 0; opacity: 0.9; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 4px; font-weight: bold; }
+        .status.ok { background: #d4edda; color: #155724; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        .books { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; }
+        .book { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .book h3 { margin: 0 0 5px; color: #151515; }
+        .book .author { color: #666; font-style: italic; }
+        .book .year { color: #999; font-size: 0.9em; }
+        .book .desc { margin-top: 10px; color: #333; line-height: 1.4; }
+        .refresh-btn { background: #0066cc; color: white; border: none; padding: 10px 20px;
+          border-radius: 4px; cursor: pointer; font-size: 14px; margin: 10px 5px; }
+        .refresh-btn:hover { background: #004999; }
+        .refresh-btn.large { background: #6c757d; }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>Bookstore</h1>
+        <p>DevConf.CZ 2026 Demo | Network Observability Operator</p>
+      </div>
+      <div>
+        <button class="refresh-btn" onclick="fetchBooks()">Fetch Books (Normal)</button>
+        <button class="refresh-btn large" onclick="fetchLarge()">Fetch Large Payload (MTU Test)</button>
+        <button class="refresh-btn" onclick="checkHealth()">Health Check</button>
+      </div>
+      <div id="status" class="status ok">Status: Loading...</div>
+      <div id="books" class="books"></div>
+
+      <script>
+        const API_BASE = '/api';
+
+        async function fetchBooks() {
+          const status = document.getElementById('status');
+          const booksDiv = document.getElementById('books');
+          try {
+            status.className = 'status ok';
+            status.textContent = 'Fetching books...';
+            const start = Date.now();
+            const res = await fetch(API_BASE + '/books', { signal: AbortSignal.timeout(10000) });
+            const elapsed = Date.now() - start;
+            const data = await res.json();
+            if (Array.isArray(data)) {
+              status.textContent = `Loaded ${data.length} books in ${elapsed}ms`;
+              booksDiv.innerHTML = data.map(b =>
+                `<div class="book">
+                  <h3>${b.title}</h3>
+                  <div class="author">${b.author}</div>
+                  <div class="year">${b.year}</div>
+                  <div class="desc">${b.description || ''}</div>
+                </div>`
+              ).join('');
+            } else {
+              throw new Error(data.error || 'Unknown error');
+            }
+          } catch (e) {
+            status.className = 'status error';
+            status.textContent = 'ERROR: ' + e.message;
+            booksDiv.innerHTML = '';
+          }
+        }
+
+        async function fetchLarge() {
+          const status = document.getElementById('status');
+          try {
+            status.className = 'status ok';
+            status.textContent = 'Fetching large payload...';
+            const start = Date.now();
+            const res = await fetch(API_BASE + '/large', { signal: AbortSignal.timeout(15000) });
+            const elapsed = Date.now() - start;
+            const data = await res.json();
+            const size = JSON.stringify(data).length;
+            status.textContent = `Large payload: ${(size/1024).toFixed(1)}KB received in ${elapsed}ms (${data.books?.length || 0} items)`;
+          } catch (e) {
+            status.className = 'status error';
+            status.textContent = 'LARGE PAYLOAD ERROR: ' + e.message + ' (possible MTU issue?)';
+          }
+        }
+
+        async function checkHealth() {
+          const status = document.getElementById('status');
+          try {
+            const start = Date.now();
+            const res = await fetch(API_BASE + '/health', { signal: AbortSignal.timeout(5000) });
+            const elapsed = Date.now() - start;
+            const data = await res.json();
+            status.className = 'status ok';
+            status.textContent = `Health OK: ${data.hostname} responded in ${elapsed}ms`;
+          } catch (e) {
+            status.className = 'status error';
+            status.textContent = 'HEALTH CHECK FAILED: ' + e.message;
+          }
+        }
+
+        // Auto-fetch on load
+        fetchBooks();
+      </script>
+    </body>
+    </html>
+  api-proxy.conf: |
+    # Proxy API calls to backend — included in the default server block
+    # via /opt/app-root/etc/nginx.default.d/
+    location /api/ {
+        proxy_pass http://backend-api:5000/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 15s;
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: demo-app
+  labels:
+    app: frontend
+    tier: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        tier: frontend
+    spec:
+      containers:
+        - name: nginx
+          image: registry.redhat.io/ubi9/nginx-124:latest
+          command: ["/usr/sbin/nginx", "-g", "daemon off;"]
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: html
+              mountPath: /opt/app-root/src
+            - name: nginx-conf
+              mountPath: /opt/app-root/etc/nginx.default.d
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: html
+          configMap:
+            name: frontend-config
+            items:
+              - key: index.html
+                path: index.html
+        - name: nginx-conf
+          configMap:
+            name: frontend-config
+            items:
+              - key: api-proxy.conf
+                path: api-proxy.conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: demo-app
+  labels:
+    app: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: frontend
+  namespace: demo-app
+spec:
+  to:
+    kind: Service
+    name: frontend
+  port:
+    targetPort: 8080

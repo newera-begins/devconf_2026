@@ -1,0 +1,117 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-credentials
+  namespace: demo-app
+stringData:
+  POSTGRES_USER: demo
+  POSTGRES_PASSWORD: demo123
+  POSTGRES_DB: bookstore
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: database-init
+  namespace: demo-app
+data:
+  init.sh: |
+    #!/bin/bash
+    psql -d $POSTGRESQL_DATABASE <<'EOSQL'
+    GRANT ALL ON SCHEMA public TO demo;
+    CREATE TABLE IF NOT EXISTS books (
+      id SERIAL PRIMARY KEY,
+      title VARCHAR(200) NOT NULL,
+      author VARCHAR(100) NOT NULL,
+      year INTEGER,
+      description TEXT
+    );
+    INSERT INTO books (title, author, year, description) VALUES
+      ('The Kubernetes Book', 'Nigel Poulton', 2023, 'A comprehensive guide to Kubernetes for beginners and pros alike.'),
+      ('Networking and Kubernetes', 'James Strong', 2022, 'Deep dive into CNI, services, and network policies in K8s.'),
+      ('Linux Observability with BPF', 'David Calavera', 2019, 'Learn eBPF and BCC tools for performance analysis and networking.'),
+      ('Site Reliability Engineering', 'Betsy Beyer', 2016, 'How Google runs production systems at scale.'),
+      ('Designing Data-Intensive Applications', 'Martin Kleppmann', 2017, 'The big ideas behind reliable, scalable, and maintainable systems.'),
+      ('Cloud Native DevOps with Kubernetes', 'John Arundel', 2022, 'Building and running applications with Kubernetes and cloud native tools.'),
+      ('Production Kubernetes', 'Josh Rosso', 2021, 'Best practices for building successful cloud native infrastructure.'),
+      ('Kubernetes Patterns', 'Bilgin Ibryam', 2019, 'Reusable elements for designing cloud native applications.')
+    ON CONFLICT DO NOTHING;
+    GRANT ALL ON TABLE books TO demo;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO demo;
+    EOSQL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database
+  namespace: demo-app
+  labels:
+    app: database
+    tier: data
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+        tier: data
+    spec:
+      containers:
+        - name: postgres
+          image: registry.redhat.io/rhel9/postgresql-15:latest
+          ports:
+            - containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: POSTGRES_USER
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: POSTGRES_DB
+          volumeMounts:
+            - name: init-sql
+              mountPath: /opt/app-root/src/postgresql-start/
+            - name: data
+              mountPath: /var/lib/pgsql/data
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+      volumes:
+        - name: init-sql
+          configMap:
+            name: database-init
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  namespace: demo-app
+  labels:
+    app: database
+spec:
+  selector:
+    app: database
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+  type: ClusterIP
