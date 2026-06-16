@@ -1,4 +1,3 @@
-# devconf_2026
 # Who Dropped the Packet? Solving K8s Network Mysteries in Real-Time
 
 **DevConf.CZ 2026 | June 19 | 30-Minute Talk by Neeraj Bhatt**
@@ -16,7 +15,7 @@ Live troubleshooting demo using eBPF and the OpenShift Network Observability Ope
 5. [Step-by-Step: Deploy and Verify the Operator](#step-by-step-deploy-and-verify)
 6. [Step-by-Step: Deploy the Demo Application](#step-by-step-deploy-the-demo-application)
 7. [Scenario 1: Silent NetworkPolicy Drops — With Full Output](#scenario-1-silent-networkpolicy-drops)
-8. [Scenario 2: Hairpin NAT / Same-Node Failure — With Full Output](#scenario-2-hairpin-nat--same-node-failure)
+8. [Scenario 2: Egress NetworkPolicy Blocks Database — With Full Output](#scenario-2-egress-networkpolicy-blocks-database)
 9. [tcpdump vs NOO — Real Command Comparison](#tcpdump-vs-noo-comparison)
 10. [Troubleshooting](#troubleshooting)
 
@@ -41,9 +40,8 @@ devconf/
     traffic-generator.sh            ← Sends continuous traffic between all tiers
     scenario1-netpol-break.sh    ← Trigger NetworkPolicy drops (safe, no sysctl)
     scenario1-netpol-fix.sh      ← Remove blocking NetworkPolicy
-    scenario2-egress-break.sh      ← Trigger hairpin NAT / same-node failure
-    scenario2-egress-fix.sh        ← Clean up hairpin scenario
-    scenario2-traditional-debug.sh ← Run tcpdump/conntrack/ovn-trace to show tools failing
+    scenario2-egress-break.sh       ← Trigger egress DB block (safe, no sysctl)
+    scenario2-egress-fix.sh         ← Remove egress block
     cleanup-all.sh                  ← Reset everything to clean state
     setup-storage-and-loki.sh       ← Full setup: LVM Storage + MinIO + Loki (bare metal)
     reset-loki-storage.sh           ← Wipe Loki data and recreate fresh PVs
@@ -702,166 +700,123 @@ Scenario 1 cleaned up. Check NOO dashboard: drops should stop.
 
 ---
 
-## Scenario 2: Hairpin NAT / Same-Node Failure
+## Scenario 2: Egress NetworkPolicy Blocks Database
 
 ### The Story
 
-This is the most complex OVN edge case. Pod A accesses a Service, and the backing Pod B
-is on the **same node**. OVN must "hairpin" the traffic: DNAT → tunnel → router → back
-to the same node. A restrictive NetworkPolicy causes a conntrack tuple mismatch on the
-return path. Same-node traffic fails. Cross-node traffic works perfectly.
+An EGRESS NetworkPolicy on backend-api blocks port 5432 (PostgreSQL). Health
+checks work (no DB needed). The books endpoint fails. The database is perfectly
+healthy. Every traditional tool sends you debugging PostgreSQL for 30+ minutes.
+
+> **Note:** The hairpin NAT scenario (CT_INVALID on same-node) is covered in
+> `hairpin-explained.md` as a real-world case study. It was fixed in OCP 4.21
+> (Bug 1903651). This demo uses egress blocking because it reproduces reliably
+> on all OCP versions.
 
 ### Why Traditional Tools CANNOT Find This RCA
 
-- **OVN trace:** Says "output to localport" — the logical pipeline is CORRECT.
-- **ovs-appctl ofproto/trace:** Simulates the OpenFlow pipeline. Says forward the packet.
-  But it CANNOT simulate the conntrack state race condition on the return path.
-- **tcpdump:** Shows SYN going in, maybe RST or nothing back. Can't tell you WHY.
-- **conntrack -L:** Shows entries but you'd need to correlate entries across the
-  DNAT+SNAT path at the exact moment of the drop. Practically impossible.
-- The key insight: the drop happens on the RETURN path, in the conntrack layer,
-  AFTER the OVN pipeline has already said "forward." No OVN-level tool can see it.
+- **Health check:** Returns HTTP 200 — "app is healthy" (MISLEADING — no DB needed)
+- **Database pod:** Running, 8 books, `psql` works — "PostgreSQL is fine"
+- **Endpoints:** Exist — "service is configured correctly"
+- **tcpdump:** SYN to port 5432 with no SYN-ACK — "database isn't responding" (WRONG)
+- **OVN LB:** DNAT mapping correct — "load balancer is fine"
+- **OVS flows:** Flows for port 5432 exist — but the drop is in table 79 (egress ACL
+  default-deny), matching on SOURCE IP, not destination port. Hidden among 5000+ rules.
+- **App logs:** Health checks working, no errors — "app looks fine"
 
 ### BREAK IT
 
 ```bash
-$ bash demo-scripts/scenario2-hairpin-break.sh
+$ bash demo-scripts/scenario2-egress-break.sh
 
 ========================================================
-  SCENARIO 2: The Hairpin NAT Trap
-  Same-node traffic fails, cross-node works fine...
+  SCENARIO 2: The Database That Isn't Broken
+  Egress policy blocks DB — but everything LOOKS fine
 ========================================================
 
-Backend-api is on node: ip-10-0-153-198.us-east-2.compute.internal
-Other worker node:      ip-10-0-171-45.us-east-2.compute.internal
+Step 1: Verifying everything works (baseline)...
+  Health: HTTP 200 ✓
+  Books: HTTP 200 ✓
+  Database: 8 books ✓
 
-Step 1: Deploying client pod on SAME node as backend-api...
-Step 2: Deploying client pod on DIFFERENT node...
-Step 3: Waiting for client pods to be ready...
-  Both client pods ready.
-
-Step 4: Verifying connectivity (before breaking)...
-  Same-node (client-same-node → backend-api): HTTP 200
-  Cross-node (client-diff-node → backend-api): HTTP 200
-
-Step 5: Applying restrictive NetworkPolicy on backend-api...
+Step 2: Applying EGRESS NetworkPolicy...
   NetworkPolicy applied.
 
-Step 6: Testing connectivity AFTER breaking...
+Step 3: Testing AFTER applying egress block...
 
-  === Same-Node (client-same-node → backend-api) ===
-    Request 1: HTTP 000 ★ FAILED
-    Request 2: HTTP 000 ★ FAILED
-    Request 3: HTTP 200
-    Request 4: HTTP 000 ★ FAILED
-    Request 5: HTTP 000 ★ FAILED
-
-  === Cross-Node (client-diff-node → backend-api) ===
+  === Health endpoint (SHOULD WORK) ===
     Request 1: HTTP 200
     Request 2: HTTP 200
     Request 3: HTTP 200
-    Request 4: HTTP 200
-    Request 5: HTTP 200
 
-  RESULTS:
-  Same-node failures:  4 / 5
-  Cross-node failures: 0 / 5
-  ★ Same-node traffic is failing more than cross-node!
-  ★ This is the classic hairpin NAT pattern.
+  === Books endpoint (SHOULD FAIL) ===
+    Request 1: ★ FAILED — timeout (no response from DB)
+    Request 2: ★ FAILED — timeout (no response from DB)
+    Request 3: ★ FAILED — timeout (no response from DB)
+
+  Database pod: Running, 8 books. PostgreSQL is FINE.
+  Frontend route: HTTP 200 (HTML loads fine)
 ```
 
-### What Traditional Tools Show You (useless)
+### What Traditional Tools Show (run LIVE)
 
 ```bash
-# OVN trace says FORWARD — everything looks correct:
-$ ovn-trace --summary <switch> 'inport=="client-same-node" && ...'
-# output: ... ct_next ... ct_dnat ... output to "backend-api" ...
-# OVN says: FORWARD. But the packet DROPS. OVN trace is WRONG here
-# (not wrong — it's just blind to the conntrack issue on the return path).
-
-# ovs-appctl also says forward:
-$ ovs-appctl ofproto/trace br-int 'in_port=X,...'
-# output: ... output:Y
-# OpenFlow says: FORWARD. The drop is in kernel conntrack, not OVS.
-
-# tcpdump: SYN goes in, nothing comes back:
-$ oc debug node/$NODE -- tcpdump -i <veth> -n port 5000
-14:50:01 IP 10.128.2.25.45678 > 10.128.2.15.5000: Flags [S]
-# No SYN-ACK. tcpdump can't tell you if this is a NetworkPolicy,
-# a conntrack issue, or a routing problem. Just silence.
-
-# The HAIRPIN PATH (why this is so hard):
-#
-#   client-same-node  (on worker-1)
-#        │
-#        ▼ SYN to ClusterIP
-#   [ br-int on worker-1 ]
-#        │
-#   [ OVN logical switch ]  ← OVN trace: "forward"
-#        │
-#   [ OVN logical router ]  ← DNAT: ClusterIP → PodIP
-#        │
-#   [ geneve tunnel to SELF ]  ← hairpin: goes through tunnel back to same node
-#        │
-#   [ br-int on worker-1 again ]
-#        │
-#   [ conntrack check ]  ← RETURN packet after SNAT doesn't match
-#        │                  original conntrack entry → CT_INVALID
-#        ▼
-#   DROPPED  ← invisible to tcpdump, OVN trace, ovs-ofctl
-#              only eBPF kfree_skb sees this
+$ bash demo-scripts/scenario2-traditional-debug.sh
 ```
 
-### What NOO Shows (the answer)
+9 REAL commands. Key findings:
 
-Open **OCP Console → Observe → Network Traffic → Show drops**
+| Tool | What it shows | Misleading conclusion |
+|------|-------------|----------------------|
+| Health check | HTTP 200 | "App is healthy" |
+| Books endpoint | FAILS | "Database is broken!" |
+| `psql` direct | 8 books | "PostgreSQL is fine?!" |
+| Endpoints | Exist | "Service is configured" |
+| tcpdump port 5432 | SYN, no SYN-ACK | "DB isn't responding" |
+| OVN LB | DNAT correct | "Load balancer is fine" |
+| OVS flows | 5000+ rules, port 5432 rules exist | "Pipeline is correct" |
+| OVS table 79 | `nw_src=backend-api, actions=drop` | Hidden default-deny |
+| App logs | No errors | "App looks fine" |
+
+**The drop IS in OVS** — table 79 (egress ACL), but it matches on SOURCE IP,
+not destination port. There's no rule saying "deny port 5432." The drop is
+the ABSENCE of an allow rule: port 53, 443, 5000 are allowed, 5432 is not
+→ falls to default-deny → `actions=drop`.
+
+### What NOO Shows (the answer — 5 seconds)
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  Network Traffic  [Show drops: ON]                                                  Namespace: demo-app  │
-│                                                                                                          │
-│  ┌───────────────────┬────────────────┬────────────────────┬───────┬────────────┬──────────────────────┐ │
-│  │ Source             │ Destination    │ Node Path          │ Proto │ Drop Count │ Drop Reason          │ │
-│  ├───────────────────┼────────────────┼────────────────────┼───────┼────────────┼──────────────────────┤ │
-│  │ client-same-node  │ backend-api    │ worker-1 (SAME) ★  │ TCP   │ 12         │ CT_INVALID ★         │ │
-│  │ client-diff-node  │ backend-api    │ w2 → w1 (DIFF)     │ TCP   │ 0          │ (none)               │ │
-│  │ frontend          │ backend-api    │ w1 → w1 (SAME) ★   │ TCP   │ 4          │ CT_INVALID ★         │ │
-│  └───────────────────┴────────────────┴────────────────────┴───────┴────────────┴──────────────────────┘ │
-│                                                                                                          │
-│  ★ THE PATTERN IS UNMISSABLE:                                                                            │
-│    Same-node traffic:  CT_INVALID drops                                                                  │
-│    Cross-node traffic: ZERO drops                                                                        │
-│                                                                                                          │
-│  ROOT CAUSE: Hairpin NAT conntrack mismatch.                                                             │
-│  Return packet after DNAT+SNAT doesn't match original conntrack entry.                                  │
-│  Kernel marks it CT_INVALID and drops it. Only happens on hairpin path.                                  │
-│                                                                                                          │
-│  WITHOUT NOO: need to correlate tcpdumps + conntrack tables across DNAT/SNAT path. DAYS.                │
-│  WITH NOO: filter by drops → same-node pattern visible in SECONDS.                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────┬────────────┬──────┬───────┬──────────────────┐
+│ Source              │ Dest       │ Port │ Drops │ Drop Reason      │
+├────────────────────┼────────────┼──────┼───────┼──────────────────┤
+│ backend-api        │ database   │ 5432 │ 47    │ OVS_DROP_EXPLICIT│
+│ backend-api        │ database   │ 5432 │ 38    │ OVS_DROP_EXPLICIT│
+└────────────────────┴────────────┴──────┴───────┴──────────────────┘
+
+★ Source = backend-api (the CLIENT is blocked, not the server)
+★ Port = 5432 (the missing egress allow)
+★ Drop = OVS_DROP_EXPLICIT (NetworkPolicy)
+★ Fix: add port 5432 to the egress allow list
 ```
 
 ### FIX IT
 
 ```bash
-$ bash demo-scripts/scenario2-hairpin-fix.sh
+$ bash demo-scripts/scenario2-egress-fix.sh
 
 ========================================================
   SCENARIO 2: FIX
-  Removing hairpin trigger and client pods...
+  Removing egress NetworkPolicy...
 ========================================================
 
-Step 1: Removing NetworkPolicy...
-  → Removed hairpin-trigger NetworkPolicy
+Step 1: Removing egress NetworkPolicy...
+  → Removed egress-db-block NetworkPolicy
 
-Step 2: Removing client pods...
-  → Removed client-same-node
-  → Removed client-diff-node
+Step 2: Verifying recovery...
+  Health: HTTP 200
+  Books: HTTP 200
 
-Step 3: Verifying normal connectivity...
-  frontend → backend-api: HTTP 200
-
-Hairpin scenario cleaned up. Check NOO: drops should stop.
+Scenario 2 cleaned up. Check NOO: drops should stop.
 ```
 
 ---
